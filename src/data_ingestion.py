@@ -14,6 +14,11 @@ from .database import StockDatabase
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Module constants as required
+DEFAULT_TICKERS = ['AAPL', 'MSFT', 'TSLA', 'AMZN', '^GSPC']
+DEFAULT_START = '2015-01-01'
+DEFAULT_END = '2024-12-31'
+
 
 class DataIngestion:
     """Handles data collection from yfinance and NewsAPI."""
@@ -71,6 +76,56 @@ class DataIngestion:
             logger.error(f"Error fetching data for {symbol}: {e}")
             return pd.DataFrame()
     
+    def fetch_stock_data_by_date(self, symbol: str, start_date: str = DEFAULT_START, 
+                                end_date: str = DEFAULT_END, interval: str = "1d") -> pd.DataFrame:
+        """
+        Fetch historical stock data from yfinance using date range.
+        
+        Args:
+            symbol: Stock ticker symbol
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            interval: Data interval (1d, 1wk, 1mo)
+        
+        Returns:
+            DataFrame with historical data
+        """
+        try:
+            logger.info(f"Fetching data for {symbol} ({start_date} to {end_date}, interval: {interval})")
+            
+            ticker = yf.Ticker(symbol)
+            
+            # Get historical data by date range
+            df = ticker.history(start=start_date, end=end_date, interval=interval)
+            
+            if df.empty:
+                logger.warning(f"No data returned for {symbol}")
+                return pd.DataFrame()
+            
+            # Reset index to make Date a column
+            df = df.reset_index()
+            
+            # Add metadata
+            info = ticker.info
+            stock_name = info.get('longName', symbol)
+            sector = info.get('sector', 'Unknown')
+            industry = info.get('industry', 'Unknown')
+            country = info.get('country', 'US')
+            market_cap = info.get('marketCap')
+            
+            # Add stock to database
+            self.db.add_stock(symbol, stock_name, sector, industry, country, market_cap)
+            
+            # Add price data to database
+            self.db.add_price_data(symbol, df)
+            
+            logger.info(f"Successfully fetched {len(df)} records for {symbol} from {start_date} to {end_date}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error fetching data for {symbol}: {e}")
+            return pd.DataFrame()
+    
     def fetch_multiple_stocks(self, symbols: List[str], period: str = "2y", 
                              interval: str = "1d", delay: float = 1.0):
         """
@@ -86,6 +141,48 @@ class DataIngestion:
         
         for symbol in symbols:
             df = self.fetch_stock_data(symbol, period, interval)
+            results[symbol] = df
+            
+            # Rate limiting
+            time.sleep(delay)
+        
+        return results
+    
+    def fetch_default_stocks(self, start_date: str = DEFAULT_START, 
+                            end_date: str = DEFAULT_END, interval: str = "1d",
+                            delay: float = 1.0) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch data for all default tickers using date range.
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            interval: Data interval
+            delay: Delay between requests (seconds)
+        
+        Returns:
+            Dictionary mapping tickers to DataFrames
+        """
+        logger.info(f"Fetching default stocks ({start_date} to {end_date})")
+        return self.fetch_multiple_stocks_by_date(DEFAULT_TICKERS, start_date, end_date, interval, delay)
+    
+    def fetch_multiple_stocks_by_date(self, symbols: List[str], start_date: str, 
+                                     end_date: str, interval: str = "1d", 
+                                     delay: float = 1.0) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch data for multiple stocks using date range with rate limiting.
+        
+        Args:
+            symbols: List of stock ticker symbols
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            interval: Data interval
+            delay: Delay between requests (seconds)
+        """
+        results = {}
+        
+        for symbol in symbols:
+            df = self.fetch_stock_data_by_date(symbol, start_date, end_date, interval)
             results[symbol] = df
             
             # Rate limiting

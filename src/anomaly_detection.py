@@ -4,6 +4,7 @@ Implements three methods: Z-score, Isolation Forest, and Local Outlier Factor (L
 """
 
 import pandas as pd
+import datetime
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 import logging
@@ -345,6 +346,71 @@ class AnomalyDetector:
         
         return explanation
 
+    # NEW METHODS ADDED FOR CS 210 PROJECT
+
+    def classify_anomaly_type(self, anomaly_date: datetime, fomc_dates: List[datetime], 
+                             news_df: Optional[pd.DataFrame] = None) -> str:
+        """
+        Classify anomaly type based on date, FOMC meetings, and news data.
+        
+        Args:
+            anomaly_date: Date of the anomaly
+            fomc_dates: List of FOMC meeting dates
+            news_df: DataFrame with news data (optional)
+        
+        Returns:
+            Classification: 'earnings_surprise', 'macroeconomic_event', 
+                           'sector_contagion', or 'unexplained'
+        """
+        # Check for macroeconomic event (FOMC related)
+        for fomc_date in fomc_dates:
+            if abs((anomaly_date - fomc_date).days) <= 2:
+                return 'macroeconomic_event'
+        
+        # Check for earnings surprise (news volume + sentiment spike)
+        if news_df is not None and not news_df.empty:
+            # Filter news for the anomaly date window (±1 day)
+            mask = (news_df['date'] >= anomaly_date - pd.Timedelta(days=1)) & \
+                   (news_df['date'] <= anomaly_date + pd.Timedelta(days=1))
+            window_news = news_df[mask]
+            
+            if not window_news.empty:
+                # Calculate news volume and average sentiment
+                news_volume = len(window_news)
+                avg_sentiment = window_news['sentiment_compound'].abs().mean()
+                
+                # Thresholds for earnings surprise
+                if news_volume >= 5 and avg_sentiment >= 0.5:
+                    return 'earnings_surprise'
+        
+        # Note: sector_contagion is determined separately by contagion_analysis.py
+        # This method will be called after contagion analysis
+        
+        return 'unexplained'
+    
+    def precision_by_explanation(self, anomalies_df: pd.DataFrame) -> float:
+        """
+        Calculate the ratio of anomalies with non-unexplained classification.
+        
+        Args:
+            anomalies_df: DataFrame with anomaly classifications
+        
+        Returns:
+            Precision score (0.0 to 1.0)
+        """
+        if anomalies_df.empty:
+            return 0.0
+        
+        # Count anomalies with non-unexplained classification
+        explained_mask = anomalies_df['explained_type'] != 'unexplained'
+        explained_count = explained_mask.sum()
+        
+        # Calculate precision
+        precision = explained_count / len(anomalies_df)
+        
+        logger.info(f"Precision by explanation: {explained_count}/{len(anomalies_df)} = {precision:.3f}")
+        return precision
+
 
 if __name__ == "__main__":
     # Test anomaly detection
@@ -378,19 +444,4 @@ if __name__ == "__main__":
     summary = detector.get_anomaly_summary(result_df)
     print(f"\nSummary:")
     for key, value in summary.items():
-        if key != 'feature_importance':
-            print(f"  {key}: {value}")
-    
-    # Show a few anomalies
-    anomalies = result_df[result_df['agreement_score'] >= 2]
-    if not anomalies.empty:
-        print(f"\nSample anomalies (first 3):")
-        for i, (idx, row) in enumerate(anomalies.head(3).iterrows()):
-            print(f"\nAnomaly {i+1}:")
-            print(f"  Date: {row['date'].strftime('%Y-%m-%d')}")
-            print(f"  Agreement: {row['agreement_score']}/3")
-            print(f"  Type: {row['anomaly_type']}")
-            print(f"  Close: ${row['close']:.2f}")
-            print(f"  Return: {row['daily_return']:.4f}")
-    
-    print("\nAnomaly detection test completed!")
+        print(f"  {key}: {value}")

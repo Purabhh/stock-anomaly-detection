@@ -262,3 +262,4 @@ if __name__ == "__main__":
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = cursor.fetchall()
         print(f"Tables created: {[t[0] for t in tables]}")
+DatabaseManager = StockDatabase  # alias for compatibility
