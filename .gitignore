@@ -86,3 +86,7 @@ graphify-out/
 
 # MS Office lock files
 ~$*
+
+# Demo deliverables (kept locally, not in submission)
+presentation.pptx
+video_script.md
