@@ -4,7 +4,7 @@
 
 Anomalyy: Multi-Method Detection and Semantic Classification of Stock-Market Anomalies Using FOMC Events, GDELT News Sentiment, and Cross-Stock Contagion
 
-[Anomalyy](https://github.com/Purabhh/Anomalyy) | Video link
+[Anomalyy](https://github.com/Purabhh/Anomalyy) | [Video](https://youtu.be/2hAyCN49Kq4)
 
 ## Team Members
 
