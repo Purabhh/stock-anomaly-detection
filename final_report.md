@@ -1,0 +1,165 @@
+# Final Report
+
+## Title
+
+Anomalyy: Multi-Method Detection and Semantic Classification of Stock-Market Anomalies Using FOMC Events, GDELT News Sentiment, and Cross-Stock Contagion
+
+## Team Members
+
+- Purabh Singh
+
+## Submission Links
+
+- GitHub Repository: https://github.com/Purabhh/Anomalyy
+- Demo Video: [TBA]
+
+## 1. Problem Definition and Background
+
+Financial markets produce an enormous volume of data every day (price, volume, news headlines, and central bank announcements), but very few of them, labeled as "anomalous" days, are responsible for a disproportionate amount of risk and return of investors. To be able to detect such days and find out their likely cause is not easy: anomaly detection will give you the list of dates, but you can do nothing with it, since it does not have enough context.
+
+In this project, an attempt will be made to find out whether unsupervised anomaly detection on historical stock market data, along with the inclusion of external factors such as Federal Reserve meetings, news sentiment analysis, and cross-stock market contagion, could help generate labels to make anomaly detection more transparent and explainable. The key research question for this project, formulated in the project proposal, is whether historical stock market data anomalies can be identified using machine learning and statistical methods, and whether they can be explained using news events, macroeconomic reports, and cross-stock market contagion.
+
+This project will involve the use of all three major topics covered in class in one flow: database management (a normalized 4-table schema design), data ingestion and cleansing (using price data from `yfinance` and news sentiment from GDELT 2.0 GKG by way of Google BigQuery), and machine learning (using unsupervised methods such as Z-score thresholding, Isolation Forest, and Local Outlier Factor). Stock market data is especially suitable for use in data management since it is voluminous, time-stamped, multi-source, and reusable for different purposes.
+
+## 2. Data Description
+
+The project relies on two data feeds and one hardcoded list of macroeconomic events. The historical OHLCV (open-high-low-close-volume) prices are accessed using Yahoo Finance and the yfinance package (free and unauthenticated). Sentiment data from news articles comes from the GDELT 2.0 GKG dataset through Google BigQuery, querying the `gdelt-bq.gdeltv2.gkg_partitioned` table to yield daily averages of the GDELT V2Tone and the number of daily articles using the service-account authentication method. The dates of all FOMC meetings for the years 2015–2024 (78 events total) are included in `src/fomc_events.py` as a hardcoded list, which keeps the macroeconomic-event classifier deterministic and offline-runnable. GDELT 2.0 was preferred to the widely used NewsAPI because NewsAPI's free tier only offers the most recent 30 days of headlines, which is inadequate for our 10-year analysis window. GDELT's BigQuery interface, by contrast, returns full-history data with a generous 1 TB per month free quota, far more than this pipeline consumes.
+
+Five tickers were selected to span individual large-cap stocks across multiple sectors plus a broad market index:
+
+| Ticker | Company | Sector |
+| --- | --- | --- |
+| AAPL | Apple Inc. | Technology |
+| MSFT | Microsoft Corporation | Technology |
+| TSLA | Tesla, Inc. | Automotive / Technology |
+| AMZN | Amazon.com, Inc. | Consumer Discretionary |
+| ^GSPC | S&P 500 Index | Broad Market |
+
+Equities such as Apple, Microsoft, Tesla, and Amazon rank as some of the most frequently traded large-cap companies on the U.S. stock market, which ensures high quality data and substantive news coverage. Inclusion of ^GSPC ("S&P 500") as a fifth "ticker" enables us to use a broader reference point in verifying that any truly sector contagion event appears both in the index and in its individual components.
+
+Analysis will cover the period starting on 2015-01-01 until 2024-12-31 (ten years). Upon download and clean-up, the resulting dataset consists of 2,514 days per ticker (totaling 12,570 days worth of price records), about 12,500 aggregated daily news rows sourced from GDELT GKG (slightly less than 5 x 2,500 as GDELT 2.0 commences from February 18, 2015), the 78 days of FOMC meeting announcements, and 1,573 high-confidence anomalies (agreement ≥ 2). Re-runs yield consistent statistics after populating the cache in SQLite. Yahoo Finance price records contain the standard OHLCV entries and an adj_close field that adjusts prices for splits and dividends; GDELT daily entries have a UTC timestamp field, the four components of V2 tone (compound, positive, negative, and neutral), along with article_count. Post-feature-engineering, price data will be expanded to include 40+ additional columns in return, moving average, volatility, momentum, volume, statistic, and pattern families (see Section 6 for the complete list).
+
+## 3. Database Design
+
+The project stores all pipeline state in a normalized SQLite database (`anomalyy.db`) with **four tables**: `stocks`, `price_data`, `news_articles`, and `anomalies`. The `stocks` table contains one row per ticker storing company name, sector, industry, country, and market capitalization, which is classical normalization: rather than repeating company metadata across thousands of price rows, we store it once and join when needed. The `price_data` table stores one row per trading day per stock and references `stocks(symbol)` through a foreign key. The `news_articles` table stores one daily aggregate per ticker carrying GDELT V2Tone sentiment plus an `article_count` reflecting the real underlying volume; its `url` column uses GDELT's `gdelt://aggregate/{ticker}/{date}` synthetic URI as a natural unique key. The `anomalies` table stores one row per detected high-confidence anomaly with the symbol, date, three method flags, agreement score, confidence, classifier label, and surrounding price-change context (1-day, 5-day, 20-day windows).
+
+The schema's integrity rests on five key constraints. `symbol` is PRIMARY KEY in `stocks` and FOREIGN KEY in the other three tables, enforcing referential integrity across the whole pipeline. `(symbol, date)` is UNIQUE in `price_data` and `(symbol, anomaly_date)` is UNIQUE in `anomalies`, both preventing duplicate rows on re-run. `url` is UNIQUE in `news_articles`, which combined with `INSERT OR IGNORE` makes news ingestion idempotent. Three indexes on `price_data(symbol, date)`, `news_articles(symbol, published_at)`, and `anomalies(symbol, anomaly_date)` speed up the date-range and per-ticker queries that dominate downstream analysis. Separating sentiment data from price data and detection results, rather than denormalizing into one wide table, keeps each table's responsibility tight and supports SQL queries that join only the columns each analysis actually needs. After loading, the pipeline automatically verifies that `price_data` row counts match the source DataFrame lengths to guard against silent insertion failures.
+
+### SQL Analysis
+
+The notebook in `notebooks/analysis.ipynb` includes 11 documented SQL queries organized into two tiers. The basic tier (six queries) covers row counts per ticker, the most recent close price per ticker (using a correlated subquery on `MAX(date)`), average GDELT sentiment plus total article volume per ticker, anomaly counts grouped by classifier label, anomaly counts per ticker (including the consensus-3 subset), and date coverage per ticker. The advanced tier (five queries) covers the top-10 highest-agreement anomalies ordered by agreement then confidence, a three-way `LEFT JOIN` across `anomalies`, `price_data`, and `news_articles` filtered to the sentiment-spike subset, per-month anomaly density using `strftime('%Y-%m', anomaly_date)` for date bucketing, a cross-tabulation of classifier label by ticker via `GROUP BY symbol, label` then pivoted in Pandas, and a self-join contagion query that finds dates where 3+ symbols had simultaneous anomalies via `GROUP BY anomaly_date HAVING COUNT(DISTINCT symbol) >= 3`. Together these queries demonstrate basic GROUP BY aggregation, correlated subqueries, multi-table joins, date functions, and self-joins.
+
+## 4. Data Cleaning and Preparation
+
+These eight steps include five hard checks that will drop failing rows or cause failure in case of critical issues and three soft checks that do the necessary normalization in place. The pipeline includes data cleaning functions that are implemented separately: in `src/data_ingestion.py` for price data and in `src/news_bq.py` for GDELT data.
+
+These hard checks guarantee structural consistency. Firstly, yfinance returns data with the expected OHLCV columns; otherwise, `add_price_data` generates a warning and skips the ticker instead of writing malformed data into the table. Secondly, GDELT 2.0 GKG data starts on Feb 18, 2015, so if an earlier date is selected, it is advanced to avoid silent zero-news rows due to partitioning prior to the origin point. Thirdly, `price_data` enforces `(symbol, date) UNIQUE` constraints which ensure that the same stock on the same day can't be added multiple times; `add_price_data` deletes all data for the current ticker first to circumvent that problem. Fourthly, the `url UNIQUE` constraint on `news_articles` combined with `INSERT OR IGNORE` allows for ingesting news multiple times without side effects. Fifthly, features based on sliding windows such as SMA-200, autocorrelation statistics, and Hurst exponent are undefined during the first ~200 days of each ticker; these rows are excluded in feature engineering step to prevent participation in detection algorithm.
+
+The soft checks normalize in place to keep downstream consumers stable. yfinance returns title-case column names (`Date`, `Open`, `Close`); the database write uses title-case to match `add_price_data`'s contract, and the returned DataFrame is then renamed to lowercase for downstream feature engineering. Newer yfinance versions auto-adjust `Close` and drop `Adj Close`, so the pipeline synthesizes `Adj Close` from `Close` when missing, keeping the database schema stable across yfinance versions. GDELT BigQuery returns tz-aware UTC timestamps while the anomaly classifier uses tz-naive timestamps, and mixing the two raises a `TypeError`; the classifier strips timezone info from news dates inside `classify_anomaly_type` before comparing windows. Separately, GDELT's V2Tone columns are reported in the range [-100, +100] and the BigQuery extraction divides by 100 inside the SQL query so that the stored `sentiment_compound` value lives in [-1, 1], the same scale VADER uses, which means downstream code can treat both sources uniformly without a per-row branch.
+
+On the live 10-year, 5-ticker dataset all five tickers passed the schema check, the GDELT origin clamp fired once per ticker (start dates of `2015-01-01` were clamped to `2015-02-18`), the feature-engineering warm-up dropped roughly 200 rows per ticker (~1,000 total) since the 200-day SMA cannot exist before day 200, and after cleaning approximately 2,300 trading days per ticker were available for detection. The cleaning pipeline is essential because yfinance schema changes (such as the recent removal of `Adj Close`) would otherwise break the database write silently, tz-aware vs tz-naive datetime mismatches between data sources produce hard-to-debug `TypeError`s if not normalized at ingestion, and the database unique constraints would block re-runs entirely if the cleaning steps did not idempotently overwrite existing rows.
+
+## 5. Exploratory Analysis and Visualization
+
+Exploratory analysis focused on understanding the temporal distribution of anomalies, their classification breakdown, and their relationship to known market events. Eleven visualizations were generated, organized into three categories. The pipeline itself produces five per-ticker price-with-anomaly charts (one each for AAPL, MSFT, TSLA, AMZN, and ^GSPC) using Plotly's interactive `Candlestick + Bar` subplot template, with high-confidence anomalies overlaid as red diamond markers and hover tooltips revealing date, price, and agreement score. The notebook produces three anomaly-distribution figures (anomaly count per ticker, classifier label distribution per ticker, and a monthly anomaly-density timeline that highlights high-stress periods such as Mar 2020) and three context-alignment figures (FOMC alignment showing anomaly counts in the ±2-day window around each Fed meeting, a sector contagion timeline plotting dates where 3+ tickers were simultaneously anomalous, and a cross-ticker daily-return correlation heatmap that motivates the contagion threshold).
+
+There are several observations we can make here. First, sector contagion is by far the most common explanation label for anomalies, explaining roughly 50% of all anomalies for each ticker (170/325 for AAPL, 183/338 for MSFT, etc.). This makes sense given that in regimes with high volatility such as Mar 2020, late 2018, and Oct 2022, all tickers tend to act in sync, so an anomaly in one ticker almost inevitably coincides with anomalies in others. Macroeconomic events account for a significant portion of anomalies between 16% and 22% per ticker (AAPL 22.2%, AMZN 16.0%, MSFT 16.6%, TSLA 18.1%, ^GSPC 17.2%), and the overall 18.1% rate is roughly double the expected random chance baseline derived in Section 7. The `vader_sentiment_spike` label is exceedingly rare, firing only in 9 anomalies out of all 5 tickers, less than 1%, partially due to the strictness of its per-ticker 2 σ criteria and partially due to the relative smoothness of daily average V2Tone.
+
+Finally, the cross-ticker correlation matrix on a 2,514-day window substantiates the contagion hypothesis mathematically: MSFT–^GSPC correlate at 0.798 (highest pairwise correlation); AAPL–^GSPC at 0.747; AAPL–MSFT at 0.683; and AMZN–^GSPC at 0.625. TSLA correlates poorly with other tickers (0.388 with AMZN, 0.400 with MSFT, 0.418 with AAPL, 0.465 with ^GSPC), which is consistent with the fact that TSLA has the largest standard deviation among individual stocks (daily return 3.6%); roughly 2× larger than those of any other ticker in our sample (AAPL 1.8%, MSFT 1.7%, AMZN 2.1%, ^GSPC 1.1%). Finally, the remainder of ~28% of anomalies fall into the `unexplained` category and are most likely earnings announcements, product launches, and idiosyncratic single-day news events, which the pipeline does not currently track.
+
+There is rationale behind all the decisions related to visual design of the plots. Specifically, candlestick type is preferred over lines for price because the former allows preserving open/high/low/close information that detection algorithms use. Plots displaying anomalies are not in a subplot but right alongside price because one must see the price context directly. Volume is placed in a subplot right below price to enable correlation between anomalies and volume bursts (this is what usually confirms anomalies). The dark Plotly theme is chosen in order to emphasize anomaly diamonds that are red. Summary statistics for each ticker (count of high-confidence anomalies, mean confidence, label-share breakdown) are computed in the notebook and persisted in the `anomalies` table for inspection via SQL; the `agreement_score` distribution skews toward 2 (the minimum threshold) with a small but meaningful tail at 3 (full-consensus anomalies, the highest-confidence subset).
+
+## 6. Feature Engineering and Machine Learning
+
+To prepare the cleaned price data for unsupervised detection, **40+ numerical features** were engineered from the raw OHLCV fields. All features are computed within each ticker independently to prevent leakage across stocks. The full feature pipeline lives in `src/feature_engineering.py` and produces the following groups:
+
+| Group | Features | Rationale |
+| --- | --- | --- |
+| Returns | `daily_return`, `log_return`, `high_low_ratio`, `close_open_ratio`, `price_normalized` | Day-to-day price dynamics on log and ratio scales |
+| Moving averages | `sma_5/10/20/50/200`, matching `ema_*`, plus `price_vs_sma_*` and `price_vs_ema_*` | Smoothed trends; deviation from a moving average is a classical anomaly signal |
+| Bollinger Bands | `bb_upper/lower/width/position_20`, same for window 50 | Volatility-scaled price envelopes; band edges signal mean-reversion or breakout |
+| Volatility | `atr_14`, `volatility_5/10/20/50`, `drawdown_5/10/20/50` | Short- and medium-term price instability |
+| Momentum | `rsi_14/28`, `macd`, `macd_signal`, `macd_histogram` | Standard momentum oscillators |
+| Volume | `volume_sma_20`, `volume_ratio`, `price_volume_corr_5/10/20`, `obv`, `vwap` | Abnormal volume is a strong anomaly signal that confirms or contradicts price moves |
+| Statistical | `skew_*`, `kurtosis_*`, `return_zscore_*`, `autocorr_1/2/5`, `hurst_20` | Distributional shape and time-series memory measures |
+| Patterns | `gap_up/down/size`, `doji`, `marubozu`, `bullish_engulfing`, `bearish_engulfing` | Binary candle-pattern flags from technical analysis |
+
+The detection task is unsupervised, so there is no target variable: the pipeline does not have access to ground-truth anomaly labels, and the goal is to flag *and explain* unusual days rather than predict a future quantity. The engineering features exhibit expected patterns of redundancy: moving averages of the same family are highly correlated (`sma_5` and `sma_10` correlate at over 0.99); this does not pose any problem for the detectors because neither Isolation Forest nor LOF are bothered by correlated features, and while Z-score treats each feature independently, PCA was employed before using Isolation Forest and LOF on the features to reduce redundancy. While moving averages can thus mostly be seen as redundant, the `daily_return`, `volatility_*`, and `volume_ratio` are almost independent of the moving-average features cluster, and hence are the most interesting features to use for discriminating between anomalous days versus normal ones. Binary pattern features such as gap, doji, marubozu, and engulfing are few and lowly correlated to most continuous features and provide orthogonal signal.
+
+Three unsupervised anomaly-detection methods were applied and combined through agreement scoring. They were chosen to be complementary, with each one detecting a different kind of "unusual" so that their consensus is more robust than any single method alone:
+
+| Model | Type | Why Selected |
+| --- | --- | --- |
+| **Z-Score Thresholding** | Statistical (univariate) | Simple, interpretable baseline; flags any day where any single feature exceeds 3 σ from its mean. Sensitive to extreme single-feature spikes that multivariate methods may average away. |
+| **Isolation Forest** | Ensemble / tree-based (multivariate) | Isolates rare points by random feature splits; well-suited to high-dimensional financial features; insensitive to feature scaling. |
+| **Local Outlier Factor (LOF)** | Density-based (multivariate) | Detects points with substantially lower local density than their neighbors; complements Isolation Forest by catching anomalies that are unusual *relative to a local cluster* rather than globally. |
+
+The three methods were then fitted on the same set of features, PCA first to a 20-component subspace to address potential multicollinearity in the moving-average and lag features before Isolation Forest and LOF. The flags generated by the three methods are summed and recorded as `agreement_score` ranging from 0 (no detection by any method) to 3 (detection by all three methods). A flag of 1 indicates weak signal (the day persists for further examination but doesn't get classified by the classifier); only a flag of 2 or 3 results in classification to either `anomalies` table or the classifier. This threshold ≥ 2 is intentionally conservative, because an outlier flagged by one noisy detection method alone can hardly be called a high-confidence anomaly, and out of total trading days in our dataset, there are 1,573 days satisfying this criterion (12%, consistent with 10% `contamination` passed to Isolation Forest and LOF).
+
+Then after detection, each high-confidence anomaly will have to go through anomaly type assignment by `AnomalyDetector.classify_anomaly_type` in strict order of priority: `macroeconomic_event` if the anomaly date is within ±2 days of an FOMC meeting, `sector_contagion` if the date is on the contagion list (≥ 3 tickers with anomalies in a 3-day window), `vader_sentiment_spike` if in ±1 day, ≥ 5 articles are aggregated, and window mean sentiment is ≥ 2 σ from the historical mean, otherwise `unexplained`. The last case's criterion employs a per-ticker z-score metric as opposed to absolute value of sentiment because GDELT V2Tone daily averages cluster around zero for any ticker; thus, a rule using absolute value of sentiment (like `|compound| > 0.3`) is practically impossible. A more accurate definition of a sentiment spike is one that deviates from the corresponding ticker's historic average, so we use a z-score.
+
+Since the project is unsupervised, there is neither a train/test split nor accuracy in the usual way, but there are two implied baselines that are being compared against. Firstly, each single method detects 10% of days when it works alone (IF/LOF `contamination=0.1` parameter specifies the exact amount and Z-score 3-σ threshold produces roughly the same results), while consensus of agreeing ≥ 2 methods reduces this value to ~12%, resulting in less noisy and more accurate data than single-method output would have produced. The second implied baseline is a random overlap measure for FOMC: since each ticker has 2,514 trading days and 78 × 3 ≈ 234 of those days fall into ±2 days around each FOMC meeting date (due to the mid-week nature of these meetings), one can assume the baseline anomaly probability to be 234 / 2,514 ≈ 9.3%, whereas the actual FOMC-overlap percentage observed was 18.1%, which is roughly 2× this value, confirming the hypothesis that detector does detect anomalies, rather than random outliers.
+
+## 7. Results and Discussion
+
+The full pipeline detected **1,573 high-confidence anomalies** (agreement ≥ 2) across the five tickers and 10-year window. The breakdown by ticker and classifier label is:
+
+| Ticker | Total | macroeconomic_event | sector_contagion | vader_sentiment_spike | unexplained |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AAPL | 325 | 72 | 170 | 3 | 80 |
+| MSFT | 338 | 56 | 183 | 1 | 98 |
+| TSLA | 309 | 56 | 167 | 3 | 83 |
+| AMZN | 293 | 47 | 146 | 0 | 100 |
+| ^GSPC | 308 | 53 | 175 | 2 | 78 |
+| **Total** | **1,573** | **284** | **841** | **9** | **439** |
+
+*(Values queried directly from the `anomalies` table in `anomalyy.db`. The notebook in `notebooks/analysis.ipynb` reproduces these exact numbers.)*
+
+Because no ground-truth anomaly labels exist, conventional precision and recall cannot be computed. Instead the project reports **precision-by-explanation**, defined as the fraction of high-confidence anomalies that received a non-`unexplained` label. For the full run this works out to (284 + 841 + 9) / 1,573 = 1,134 / 1,573 ≈ **72.1%**. In other words, roughly seven out of every ten high-confidence anomalies coincide with a known macroeconomic event, a cross-stock contagion event, or a news-sentiment spike, and only the remaining ~28% are unaccounted for by the three context sources.
+
+As expected, sector contagion explains the lion's share of the anomalies (at 54% of total), making perfect sense given how highly correlated US large-cap equities are; if there's an anomaly day, then it will be across all stocks, and the contagion classifier picks up this exact property. FOMC-related events are responsible for another 18%, fitting well with macroeconomic studies suggesting that Fed policies are among the biggest daily movers of equity markets, with ±2-day windows giving enough time for the actual event + follow-up market reactions. Sentiment spikes only explain less than 1% of the anomalies (which is partly by design - the threshold used was quite high), yet there is a structural factor here: the nature of GDELT V2Tone dataset makes it hard to catch individual company-specific events due to daily smoothing, and in a future version that uses per-article tone, we might see this number increase sharply. The classifier firing even sometimes (9 cases), proves that the rule is not dead - the classifier catches the strongest tone shifters.
+
+27.9% of anomalies are unexplained and, again, this result fits the known limitations of the model: the pipeline does not monitor earnings announcements, M&A news, or other company-specific catalysts, therefore, it is very likely that nearly all of the unexplained cases are earnings driven, and it would be easy to test in the future with an additional calendar of earnings. Therefore, can unsupervised detection in combination with contextual classification identify and explain anomaly trading days? Yes to both parts: ~12% of all dates were labeled as high-confidence anomalies (much higher than a noise floor of any one method), and about 72% of these can be attributed to certain reasons from the three contexts provided. Moreover, those 28% left seem to fit earnings/idiosyncratic categories that are outside the scope of the research question but perfectly match the unexplained part. Overall, the combination of two components proves to be better than each one alone - while an unlabeled set of anomalies ("March 16, 2020: anomaly") provides no information for use, a labeled set ("March 16, 2020: sector_contagion") gives valuable insights.
+
+## 8. Limitations and Future Work
+
+### Scope Changes from the Proposal
+
+Three substantive changes were made between the February proposal and the final implementation. At first, it was about the news source, as NewsAPI that the proposal used had just a last 30 days limit on free access, and the proposal itself promised an analysis of a 10-year time interval. Then I had to switch to the GDELT 2.0 DOC API, but it could handle just a maximum number of a dozen of requests before giving you HTTP 429 errors and did not mention any limits. Therefore, my third attempt became the use of the GDELT BigQuery with the same GKG index underneath but an absence of any kind of request limit and a generous 1 TB/month free plan.
+
+The second improvement to mention is sentiment scoring. While the proposal mentioned implied VADER score computed on headlines (given the fact that NewsAPI provided only headline), switching to GDELT BigQuery allowed us to implement an even better solution: GDELT database contains ready-to-use pre-calculated V2Tone field with normalized sentiment scores of articles' body content (in the range of [-100, 100]) and divided by 100 in the query. This field gets automatically inserted into `news.sentiment_compound` column and therefore does not require changing the rest of the code anywhere else.
+
+Anomaly Classification: The third change involved anomaly classification. The paper stated that "each verified anomaly will be manually classified by category (earnings, macroeconomic event, sector contagion, unexplained)," but having 1,573 high-confidence anomalies in the final dataset, the manual approach had become impractical. An anomaly classifier based on the rules from Section 6 has been implemented, using four-way precedence. A different category has been used: while `earnings` category in the proposal requires an earnings calendar (which does not fall under the scope to implement), the `vader_sentiment_spike` (also defined via per-ticker z-score) provides a good news-driven substitute. The integration of an earnings calendar should be the most impactful item in follow-up work and could easily explain a significant share of the 27.9% `unexplained` anomalies.
+
+### Inherent Limitations
+
+However, a number of limitations are intrinsic to the sources of information, the technology stack used, and model selection itself and thus could not be addressed through any amount of additional programming efforts. For example, the GDELT 2.0 GKG index starts on Feb 18, 2015, therefore the first six weeks are devoid of any news coverage and the `vader_sentiment_spike` anomaly detector cannot be triggered during that time period; the BigQuery ticker-specific filter uses fuzzy entity match through `V2Organizations LIKE '%COMPANY NAME%'`, which provides good results in case of clear-cut ticker names such as "Microsoft Corp", while over- or under-matching for less clear ticker names like "Apple"; V2Tone refers to the corpus-wide mean sentiment value, so a highly negative article on an otherwise neutral day will not trigger the anomaly detector; the pipeline has no access to any earnings date list, so most of the 27.9% `unexplained` anomalies are likely earnings-related; finally, the analysis suffers from survivorship bias due to using only those tickers which are currently listed.
+
+Speaking technically, SQLite is a single-writer database and hence not scalable for a multi-process ingestion path (PostgreSQL is a good choice to replace SQLite), the ingestion can process at batch mode only the full 10-year window in one step, and five tickers is not a big universe for studying sector patterns since all five are technology-based. Speaking model-wise, the `contamination=0.1` hyperparameter is set to the same value for Isolation Forest and LOF, and is the only parameter in the two models, determining directly the number of anomalies; using a different value leads to a completely different precision-by-explanation score, and fine-grain tuning was not conducted. Finally, the ±2-day FOMC event and ±1-day sentiment event windows are heuristically selected according to common practice in the literature on event studies; they were never calibrated on a separate validation set, which is impossible since there is none in an unsupervised setting. The precision-by-explanation score, itself a proxy for performance, is high if most anomalies align with a plausible explanation; a small labeled anomaly dataset, e.g., the COVID crisis days in March 2020, can be used to cross-check the actual anomaly detection quality. Finally, the per-ticker z-score for the spike-in sentiment rule is computed on a static full history; this approach is biased theoretically because the z-score for a 2018 anomaly includes 2020 information; however, a non-biased solution involves a walking forward approach, which requires additional implementation effort.
+
+### Future Work
+
+- Add an **earnings calendar** (via `yfinance.calendar` or a third-party feed) as a fifth classifier label, which would likely re-explain most of the current `unexplained` bucket.
+- Switch to **per-article V2Tone** instead of daily aggregates, which would meaningfully increase `vader_sentiment_spike` recall.
+- Implement a **walk-forward sentiment baseline** that recomputes the per-ticker mean and standard deviation using only data prior to each anomaly, eliminating look-ahead bias in the z-score.
+- **Expand to a sector-diverse ticker universe** (50+ stocks across tech, financials, energy, healthcare, consumer) so sector-level contagion can be distinguished from market-wide contagion.
+- Add **GARCH-family volatility models** as a fourth detector, since the current three methods do not explicitly model volatility clustering, which is a well-documented property of financial time series.
+- Migrate to a **more scalable database backend** such as PostgreSQL with incremental ingestion if the pipeline grows beyond the current project scope.
+
+## References
+
+Breunig, M. M., Kriegel, H.-P., Ng, R. T., & Sander, J. (2000). LOF: Identifying density-based local outliers. *Proceedings of the 2000 ACM SIGMOD International Conference on Management of Data*, 93–104.
+
+Chandola, V., Banerjee, A., & Kumar, V. (2009). Anomaly detection: A survey. *ACM Computing Surveys, 41*(3), 1–58.
+
+Hutto, C. J., & Gilbert, E. (2014). VADER: A parsimonious rule-based model for sentiment analysis of social media text. *Proceedings of the International AAAI Conference on Web and Social Media, 8*(1), 216–225.
+
+Leetaru, K., & Schrodt, P. A. (2013). GDELT: Global data on events, location, and tone, 1979–2012. *Annual Convention of the International Studies Association*.
+
+Liu, F. T., Ting, K. M., & Zhou, Z.-H. (2008). Isolation Forest. *IEEE International Conference on Data Mining*, 413–422.
+
+Nassirtoussi, A. K., Aghabozorgi, S., Wah, T. Y., & Ngo, D. C. L. (2014). Text mining for market prediction: A systematic review. *Expert Systems with Applications, 41*(16), 7653–7670.
+
+Sezer, O. B., Gudelek, M. U., & Ozbayoglu, A. M. (2020). Financial time series forecasting with deep learning: A systematic literature review. *Applied Soft Computing, 90*, 106181.
+
+GDELT Project. (2015). The GDELT Global Knowledge Graph (GKG) 2.0 codebook. https://blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/
