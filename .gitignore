@@ -75,3 +75,14 @@ __pycache__/
 visualizations/*.html
 visualizations/*.png
 visualizations/*.svg
+
+# Google Cloud service account credentials (DO NOT COMMIT)
+bq_credentials.json
+*credentials*.json
+*service-account*.json
+
+# Graphify tooling output
+graphify-out/
+
+# MS Office lock files
+~$*

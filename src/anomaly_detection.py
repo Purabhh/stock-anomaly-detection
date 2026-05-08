@@ -4,9 +4,8 @@ Implements three methods: Z-score, Isolation Forest, and Local Outlier Factor (L
 """
 
 import pandas as pd
-import datetime
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import logging
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
@@ -105,12 +104,11 @@ class AnomalyDetector:
         
         # Calculate confidence score (weighted by agreement)
         result_df['confidence'] = result_df['agreement_score'] / 3.0
-        
-        # Add anomaly type based on which methods flagged it
-        result_df['anomaly_type'] = result_df.apply(
-            lambda row: self._get_anomaly_type(row), axis=1
-        )
-        
+
+        # `anomaly_type` is intentionally NOT set here. main.py overwrites it
+        # with the semantic classifier (macroeconomic_event / sector_contagion /
+        # vader_sentiment_spike / unexplained) via classify_anomaly_type().
+
         # Calculate feature importance for anomalies
         self._calculate_feature_importance(X, feature_columns, result_df)
         
@@ -189,29 +187,7 @@ class AnomalyDetector:
         logger.info(f"LOF flagged {anomaly_flags.sum()} anomalies")
         return anomaly_flags
     
-    def _get_anomaly_type(self, row: pd.Series) -> str:
-        """Determine anomaly type based on which methods flagged it."""
-        flags = [
-            ('z_score', row['z_score_anomaly']),
-            ('isolation', row['isolation_forest_anomaly']),
-            ('lof', row['lof_anomaly'])
-        ]
-        
-        active_methods = [name for name, flag in flags if flag == 1]
-        
-        if not active_methods:
-            return 'normal'
-        
-        if len(active_methods) == 3:
-            return 'consensus_anomaly'
-        elif 'z_score' in active_methods and len(active_methods) == 1:
-            return 'statistical_outlier'
-        elif 'isolation' in active_methods and 'lof' in active_methods:
-            return 'density_anomaly'
-        else:
-            return 'partial_anomaly'
-    
-    def _calculate_feature_importance(self, X: pd.DataFrame, feature_names: List[str], 
+    def _calculate_feature_importance(self, X: pd.DataFrame, feature_names: List[str],
                                     result_df: pd.DataFrame):
         """Calculate which features are most important for anomaly detection."""
         if self.isolation_forest is None:
@@ -272,82 +248,6 @@ class AnomalyDetector:
         except Exception as e:
             logger.warning(f"Could not calculate feature importance: {e}")
     
-    def get_anomaly_summary(self, result_df: pd.DataFrame) -> Dict:
-        """Generate summary statistics for detected anomalies."""
-        if result_df.empty:
-            return {}
-        
-        summary = {
-            'total_samples': len(result_df),
-            'total_anomaly_flags': int(result_df[['z_score_anomaly', 'isolation_forest_anomaly', 'lof_anomaly']].sum().sum()),
-            'z_score_anomalies': int(result_df['z_score_anomaly'].sum()),
-            'isolation_forest_anomalies': int(result_df['isolation_forest_anomaly'].sum()),
-            'lof_anomalies': int(result_df['lof_anomaly'].sum()),
-            'high_confidence_anomalies': int((result_df['agreement_score'] >= 2).sum()),
-            'consensus_anomalies': int((result_df['agreement_score'] == 3).sum()),
-        }
-        
-        # Anomaly type distribution
-        anomaly_types = result_df['anomaly_type'].value_counts().to_dict()
-        summary['anomaly_type_distribution'] = anomaly_types
-        
-        # Date range of anomalies
-        anomaly_dates = result_df[result_df['agreement_score'] >= 2]['date']
-        if not anomaly_dates.empty:
-            summary['first_anomaly_date'] = anomaly_dates.min().strftime('%Y-%m-%d')
-            summary['last_anomaly_date'] = anomaly_dates.max().strftime('%Y-%m-%d')
-            summary['anomaly_date_count'] = len(anomaly_dates.unique())
-        
-        # Feature importance summary
-        if self.feature_importance:
-            summary['top_features'] = list(self.feature_importance.keys())[:10]
-        
-        return summary
-    
-    def explain_anomaly(self, result_df: pd.DataFrame, index: int) -> Dict:
-        """
-        Provide explanation for a specific anomaly.
-        
-        Args:
-            result_df: DataFrame with anomaly detection results
-            index: Row index to explain
-        
-        Returns:
-            Dictionary with explanation
-        """
-        if index >= len(result_df):
-            return {"error": "Index out of bounds"}
-        
-        row = result_df.iloc[index]
-        
-        explanation = {
-            'date': row['date'].strftime('%Y-%m-%d') if 'date' in row else str(index),
-            'agreement_score': int(row['agreement_score']),
-            'confidence': float(row['confidence']),
-            'anomaly_type': row['anomaly_type'],
-            'methods_flagged': [],
-            'price_info': {},
-            'feature_deviations': []
-        }
-        
-        # Which methods flagged it
-        if row['z_score_anomaly']:
-            explanation['methods_flagged'].append('z_score')
-        if row['isolation_forest_anomaly']:
-            explanation['methods_flagged'].append('isolation_forest')
-        if row['lof_anomaly']:
-            explanation['methods_flagged'].append('lof')
-        
-        # Price information
-        price_cols = ['open', 'high', 'low', 'close', 'volume', 'daily_return']
-        for col in price_cols:
-            if col in row:
-                explanation['price_info'][col] = float(row[col])
-        
-        return explanation
-
-    # NEW METHODS ADDED FOR CS 210 PROJECT
-
     def classify_anomaly_type(self, anomaly_date, fomc_dates: List,
                              contagion_dates: Optional[List] = None,
                              news_df: Optional[pd.DataFrame] = None) -> str:
@@ -383,75 +283,56 @@ class AnomalyDetector:
                 if ad == cd_norm:
                     return 'sector_contagion'
 
-        # 3. VADER sentiment spike (news volume + strong polarity within ±1 day)
+        # 3. Sentiment spike: news volume in window + tone z-score >= 2.
+        # `news_volume` sums article_count when present (GDELT BQ daily
+        # aggregates carry real underlying volume there). The z-score is
+        # computed against the ticker's full-history distribution so we
+        # detect days that are extreme RELATIVE to that ticker's baseline,
+        # rather than against an absolute fixed threshold (V2Tone daily
+        # averages cluster near zero; an absolute 0.3 cutoff would never fire).
         if news_df is not None and not news_df.empty and 'sentiment_compound' in news_df.columns:
             ad_ts = pd.Timestamp(ad)
             news_dates = pd.to_datetime(news_df['date'])
+            # GDELT BQ stores published_at as UTC tz-aware; strip tz for
+            # comparison against the tz-naive anomaly date.
+            if hasattr(news_dates.dt, 'tz') and news_dates.dt.tz is not None:
+                news_dates = news_dates.dt.tz_localize(None)
             mask = (news_dates >= ad_ts - pd.Timedelta(days=1)) & \
                    (news_dates <= ad_ts + pd.Timedelta(days=1))
             window_news = news_df[mask]
             if not window_news.empty:
-                news_volume = len(window_news)
-                avg_sentiment = window_news['sentiment_compound'].abs().mean()
-                if news_volume >= 5 and avg_sentiment >= 0.3:
-                    return 'vader_sentiment_spike'
+                if 'article_count' in window_news.columns:
+                    news_volume = int(window_news['article_count'].fillna(1).sum())
+                else:
+                    news_volume = len(window_news)
+                hist_mean = news_df['sentiment_compound'].mean()
+                hist_std = news_df['sentiment_compound'].std()
+                if hist_std and hist_std > 0:
+                    window_mean = window_news['sentiment_compound'].mean()
+                    z = abs(window_mean - hist_mean) / hist_std
+                    if news_volume >= 5 and z >= 2.0:
+                        return 'vader_sentiment_spike'
 
         return 'unexplained'
-    
-    def precision_by_explanation(self, anomalies_df: pd.DataFrame) -> float:
-        """
-        Calculate the ratio of anomalies with non-unexplained classification.
-        
-        Args:
-            anomalies_df: DataFrame with anomaly classifications
-        
-        Returns:
-            Precision score (0.0 to 1.0)
-        """
-        if anomalies_df.empty:
-            return 0.0
-        
-        # Count anomalies with non-unexplained classification
-        explained_mask = anomalies_df['explained_type'] != 'unexplained'
-        explained_count = explained_mask.sum()
-        
-        # Calculate precision
-        precision = explained_count / len(anomalies_df)
-        
-        logger.info(f"Precision by explanation: {explained_count}/{len(anomalies_df)} = {precision:.3f}")
-        return precision
 
 
 if __name__ == "__main__":
-    # Test anomaly detection
+    # Standalone smoke test. Real coverage lives in tests/test_pipeline.py.
     import yfinance as yf
     from feature_engineering import FeatureEngineer
-    
+
     print("Testing anomaly detection...")
-    
-    # Fetch and engineer sample data
     ticker = yf.Ticker("AAPL")
-    df = ticker.history(period="6mo", interval="1d")
-    df = df.reset_index()
-    
+    df = ticker.history(period="6mo", interval="1d").reset_index()
+
     engineer = FeatureEngineer()
     features_df = engineer.engineer_features(df)
-    
     print(f"Engineered features shape: {features_df.shape}")
-    
-    # Detect anomalies
+
     detector = AnomalyDetector(contamination=0.05)
     result_df = detector.detect_anomalies(features_df)
-    
-    print(f"\nAnomaly detection results:")
-    print(f"Total samples: {len(result_df)}")
+
     print(f"Z-score anomalies: {result_df['z_score_anomaly'].sum()}")
     print(f"Isolation Forest anomalies: {result_df['isolation_forest_anomaly'].sum()}")
     print(f"LOF anomalies: {result_df['lof_anomaly'].sum()}")
-    print(f"High-confidence anomalies (agreement >= 2): {(result_df['agreement_score'] >= 2).sum()}")
-    
-    # Show summary
-    summary = detector.get_anomaly_summary(result_df)
-    print(f"\nSummary:")
-    for key, value in summary.items():
-        print(f"  {key}: {value}")
+    print(f"High-confidence (>=2 agree): {(result_df['agreement_score'] >= 2).sum()}")

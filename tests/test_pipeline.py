@@ -113,30 +113,13 @@ def test_fomc_labeling():
     assert result.iloc[2]['fomc_related'] == False  # Jan 1 is not near FOMC
 
 
-def test_gdelt_query_mapping():
-    """All default tickers must have a GDELT query string."""
-    from src.news_gdelt import TICKER_TO_QUERY
+def test_news_bq_filter_mapping():
+    """All default tickers must have a GDELT BQ filter clause (current news source)."""
+    from src.news_bq import TICKER_TO_FILTER
     from src.data_ingestion import DEFAULT_TICKERS
     for ticker in DEFAULT_TICKERS:
-        assert ticker in TICKER_TO_QUERY, f"No GDELT query for {ticker}"
-        assert TICKER_TO_QUERY[ticker], f"Empty GDELT query for {ticker}"
-
-
-def test_gdelt_article_shape():
-    """GDELT articles must be reshaped to NewsAPI shape so _process_and_store_news consumes them."""
-    from src.news_gdelt import _to_newsapi_shape
-    raw = {
-        'title': 'Apple beats earnings',
-        'url': 'https://example.com/a',
-        'domain': 'reuters.com',
-        'seendate': '20230315T143000Z',
-    }
-    out = _to_newsapi_shape(raw)
-    assert out['title'] == 'Apple beats earnings'
-    assert out['url'] == 'https://example.com/a'
-    assert out['source']['name'] == 'reuters.com'
-    assert out['publishedAt'] == '2023-03-15T14:30:00Z'
-    assert 'description' in out  # required by _process_and_store_news
+        assert ticker in TICKER_TO_FILTER, f"No BQ filter for {ticker}"
+        assert TICKER_TO_FILTER[ticker], f"Empty BQ filter for {ticker}"
 
 
 def test_contagion_detection():

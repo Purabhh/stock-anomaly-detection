@@ -5,9 +5,8 @@ Calculates technical indicators and derived features.
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict
 import logging
-from scipy import stats
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

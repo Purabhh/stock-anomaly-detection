@@ -6,7 +6,7 @@ SQLite database schema for Anomalyy.
 import sqlite3
 import pandas as pd
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Dict
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -78,10 +78,19 @@ class StockDatabase:
             sentiment_positive REAL,
             sentiment_neutral REAL,
             sentiment_negative REAL,
+            article_count INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (symbol) REFERENCES stocks(symbol)
         )
         """)
+
+        # Migrate existing DBs that predate the article_count column
+        # (added when news source moved from per-article NewsAPI to GDELT BQ
+        # daily aggregates carrying real underlying volume).
+        try:
+            cursor.execute("ALTER TABLE news_articles ADD COLUMN article_count INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
         
         # Table 4: anomalies - detected anomalies with agreement scores and explanation label
         cursor.execute("""
@@ -132,22 +141,26 @@ class StockDatabase:
         logger.info(f"Added/updated stock: {symbol}")
     
     def add_price_data(self, symbol: str, df: pd.DataFrame):
-        """Add price data for a stock."""
+        """Add price data for a stock. Re-run safe: replaces any existing
+        rows for this symbol so the (symbol, date) UNIQUE constraint doesn't
+        trip when main.py is re-executed against an existing DB."""
         # Ensure date column is datetime
         if 'Date' in df.columns:
             df = df.rename(columns={'Date': 'date'})
-        
+
         df['symbol'] = symbol
         df['created_at'] = datetime.now()
-        
+
         # Reorder columns to match table schema
         required_columns = ['symbol', 'date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']
         if all(col in df.columns for col in required_columns):
             df_to_insert = df[required_columns].copy()
             df_to_insert.columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'adj_close']
-            
-            # Insert or replace
+
+            # Refresh: drop existing rows for this symbol first
+            self.conn.execute("DELETE FROM price_data WHERE symbol = ?", (symbol,))
             df_to_insert.to_sql('price_data', self.conn, if_exists='append', index=False)
+            self.conn.commit()
             logger.info(f"Added {len(df_to_insert)} price records for {symbol}")
         else:
             logger.warning(f"Missing required columns for {symbol}")
@@ -156,10 +169,11 @@ class StockDatabase:
         """Add a news article with sentiment scores."""
         cursor = self.conn.cursor()
         cursor.execute("""
-        INSERT OR IGNORE INTO news_articles 
-        (symbol, published_at, title, description, source, url, 
-         sentiment_compound, sentiment_positive, sentiment_neutral, sentiment_negative)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO news_articles
+        (symbol, published_at, title, description, source, url,
+         sentiment_compound, sentiment_positive, sentiment_neutral, sentiment_negative,
+         article_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             symbol,
             article_data.get('published_at'),
@@ -170,7 +184,8 @@ class StockDatabase:
             article_data.get('sentiment_compound'),
             article_data.get('sentiment_positive'),
             article_data.get('sentiment_neutral'),
-            article_data.get('sentiment_negative')
+            article_data.get('sentiment_negative'),
+            article_data.get('article_count', 1)
         ))
         self.conn.commit()
     
